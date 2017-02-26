@@ -86,6 +86,20 @@ class kvm_regs(ctypes.Structure):
         ("rflags", ctypes.c_uint64)
     ]
 
+class kvm_run_io(ctypes.Structure):
+    _fields_ = [
+        ("direction", ctypes.c_uint8),
+        ("size", ctypes.c_uint8),
+        ("port", ctypes.c_uint16),
+        ("count", ctypes.c_uint32),
+        ("data_offset", ctypes.c_uint64)
+    ]
+
+class kvm_run_union(ctypes.Union):
+    _fields_ = [
+        ("io", kvm_run_io)
+    ]
+
 class kvm_run(ctypes.Structure):
     _fields_ = [
         ("request_interrupt_window", ctypes.c_uint8),
@@ -96,6 +110,7 @@ class kvm_run(ctypes.Structure):
         ("flags", ctypes.c_uint16),
         ("cr8", ctypes.c_uint64),
         ("apic_base", ctypes.c_uint64),
+        ("u", kvm_run_union)
     ]
 
 _IOC_NRSHIFT = 0
@@ -130,6 +145,7 @@ KVM_SET_REGS = _IOW(KVMIO, 0x82, kvm_regs)
 KVM_GET_SREGS = _IOR(KVMIO, 0x83, kvm_sregs)
 KVM_SET_SREGS = _IOW(KVMIO, 0x84, kvm_sregs)
 
+KVM_EXIT_IO = 2
 KVM_EXIT_HLT = 5
 
 PDE64_PRESENT = 1
@@ -172,9 +188,8 @@ def main(payload):
         assert vcpu_fd >= 0
         vcpu_mmap_size = libc.ioctl(sys_fd, KVM_GET_VCPU_MMAP_SIZE, 0)
         assert vcpu_mmap_size >= 0
-        run = kvm_run.from_buffer(
-            mmap.mmap(vcpu_fd, vcpu_mmap_size, prot=mmap.PROT_READ | mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
-        )
+        run_buf = mmap.mmap(vcpu_fd, vcpu_mmap_size, prot=mmap.PROT_READ | mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
+        run = kvm_run.from_buffer(run_buf)
 
         sregs = kvm_sregs()
         regs = kvm_regs()
@@ -240,13 +255,16 @@ def main(payload):
             for b in f.read():
                 mem.write_byte(b)
 
-        assert libc.ioctl(vcpu_fd, KVM_RUN, 0) >= 0
+        while True:
+            assert libc.ioctl(vcpu_fd, KVM_RUN, 0) >= 0
 
-        assert run.exit_reason == KVM_EXIT_HLT, run.exit_reason
-
-        assert libc.ioctl(vcpu_fd, KVM_GET_REGS, ctypes.byref(regs)) >= 0
-
-        exit(ctypes.c_int(regs.rdi).value)
+            if run.exit_reason == KVM_EXIT_HLT:
+                assert libc.ioctl(vcpu_fd, KVM_GET_REGS, ctypes.byref(regs)) >= 0
+                exit(ctypes.c_int(regs.rdi).value)
+            elif run.exit_reason == KVM_EXIT_IO:
+                print(chr(run_buf[run.u.io.data_offset]), end='')
+            else:
+                raise Exception("Unkown exit reasone %d", run.exit_reason)
 
 if __name__ == "__main__":
     main(sys.argv[1])
