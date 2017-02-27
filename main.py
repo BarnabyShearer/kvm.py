@@ -1,5 +1,6 @@
 #! /usr/bin/env python3
 
+import os
 import sys
 import ctypes
 import ctypes.util
@@ -113,6 +114,15 @@ class kvm_run(ctypes.Structure):
         ("u", kvm_run_union)
     ]
 
+class kvm_irqfd(ctypes.Structure):
+    _fields_ = [
+        ("fd", ctypes.c_uint32),
+        ("gsi", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("resamplefd", ctypes.c_uint32),
+        ("pad", ctypes.c_uint8 * 16),
+    ]
+
 _IOC_NRSHIFT = 0
 _IOC_TYPESHIFT = _IOC_NRSHIFT + 8
 _IOC_SIZESHIFT = _IOC_TYPESHIFT + 8
@@ -138,6 +148,9 @@ KVM_GET_VCPU_MMAP_SIZE = _IO(KVMIO, 0x04)
 KVM_CREATE_VCPU = _IO(KVMIO, 0x41)
 KVM_SET_USER_MEMORY_REGION = _IOW(KVMIO, 0x46, kvm_userspace_memory_region)
 KVM_SET_TSS_ADDR = _IO(KVMIO, 0x47)
+
+KVM_CREATE_IRQCHIP = _IO(KVMIO,   0x60)
+KVM_IRQFD = _IOW(KVMIO, 0x76, kvm_irqfd)
 
 KVM_RUN = _IO(KVMIO, 0x80)
 KVM_GET_REGS = _IOR(KVMIO, 0x81, kvm_regs)
@@ -183,17 +196,25 @@ def main(payload):
         memreg.guest_phys_addr = 0
         memreg.memory_size = 0x100000
         memreg.userspace_addr = ctypes.cast(ctypes.pointer(ctypes.c_int.from_buffer(mem)), ctypes.c_void_p).value
-        assert libc.ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, ctypes.byref(memreg)) >= 0
+        assert libc.ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, ctypes.byref(memreg)) >= 0, os.strerror(ctypes.get_errno())
+
+        assert libc.ioctl(vm_fd, KVM_CREATE_IRQCHIP) >= 0, os.strerror(ctypes.get_errno())
+
+        com1_irq = kvm_irqfd()
+        com1_irq.fd = libc.eventfd(0, 0)
+        com1_irq.gsi = 4
+        assert libc.ioctl(vm_fd, KVM_IRQFD, ctypes.byref(com1_irq)) >= 0, os.strerror(ctypes.get_errno())
+
         vcpu_fd = libc.ioctl(vm_fd, KVM_CREATE_VCPU, 0)
-        assert vcpu_fd >= 0
+        assert vcpu_fd >= 0, os.strerror(ctypes.get_errno())
         vcpu_mmap_size = libc.ioctl(sys_fd, KVM_GET_VCPU_MMAP_SIZE, 0)
-        assert vcpu_mmap_size >= 0
+        assert vcpu_mmap_size >= 0, os.strerror(ctypes.get_errno())
         run_buf = mmap.mmap(vcpu_fd, vcpu_mmap_size, prot=mmap.PROT_READ | mmap.PROT_WRITE, flags=mmap.MAP_SHARED)
         run = kvm_run.from_buffer(run_buf)
 
         sregs = kvm_sregs()
         regs = kvm_regs()
-        assert libc.ioctl(vcpu_fd, KVM_GET_SREGS, ctypes.byref(sregs)) >= 0
+        assert libc.ioctl(vcpu_fd, KVM_GET_SREGS, ctypes.byref(sregs)) >= 0, os.strerror(ctypes.get_errno())
 
         sregs.gdt.base = 0x1000
         sregs.gdt.limit = 3 * 8 - 1
@@ -242,13 +263,13 @@ def main(payload):
             | (sregs.cs.base & 0xff000000) << 56
         )
 
-        assert libc.ioctl(vcpu_fd, KVM_SET_SREGS, ctypes.byref(sregs)) >= 0
+        assert libc.ioctl(vcpu_fd, KVM_SET_SREGS, ctypes.byref(sregs)) >= 0, os.strerror(ctypes.get_errno())
 
         regs.rflags = 2
         regs.rip = 0x10000
         regs.rsp = memreg.memory_size
 
-        assert libc.ioctl(vcpu_fd, KVM_SET_REGS, ctypes.byref(regs)) >= 0
+        assert libc.ioctl(vcpu_fd, KVM_SET_REGS, ctypes.byref(regs)) >= 0, os.strerror(ctypes.get_errno())
 
         mem.seek(regs.rip)
         with open(payload, 'rb') as f:
@@ -256,13 +277,14 @@ def main(payload):
                 mem.write_byte(b)
 
         while True:
-            assert libc.ioctl(vcpu_fd, KVM_RUN, 0) >= 0
+            assert libc.ioctl(vcpu_fd, KVM_RUN, 0) >= 0, os.strerror(ctypes.get_errno())
 
             if run.exit_reason == KVM_EXIT_HLT:
-                assert libc.ioctl(vcpu_fd, KVM_GET_REGS, ctypes.byref(regs)) >= 0
+                assert libc.ioctl(vcpu_fd, KVM_GET_REGS, ctypes.byref(regs)) >= 0, os.strerror(ctypes.get_errno())
                 exit(ctypes.c_int(regs.rdi).value)
             elif run.exit_reason == KVM_EXIT_IO:
                 print(chr(run_buf[run.u.io.data_offset]), end='')
+                os.write(com1_irq.fd, ctypes.c_ulonglong(1))
             else:
                 raise Exception("Unkown exit reasone %d", run.exit_reason)
 

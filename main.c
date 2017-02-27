@@ -1,6 +1,7 @@
 void exit(int);
 int main(void);
 void start(void) {
+    __asm__ __volatile__ ("sti");
     exit(main());
 }
 void exit(int ret) {
